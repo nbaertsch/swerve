@@ -1,17 +1,14 @@
-mod auth;
-mod mgmt;
-mod serve;
-mod state;
-
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use swerve::{routes, state};
 
 #[derive(Parser, Debug)]
 #[command(name = "swerve", about = "Encrypted file staging and serving server")]
 struct Args {
     /// Management API bind address
-    #[arg(short, long, default_value = "0.0.0.0:9740")]
+    #[arg(short, long, default_value = "127.0.0.1:9740")]
     bind: String,
 
     /// API key for management authentication
@@ -24,7 +21,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -35,23 +32,24 @@ async fn main() {
         dir
     });
 
-    // Clean and create storage directory
-    if storage_dir.exists() {
-        let _ = std::fs::remove_dir_all(&storage_dir);
-    }
-    std::fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
+    // Create storage directory if it doesn't exist (never delete existing)
+    tokio::fs::create_dir_all(&storage_dir).await
+        .map_err(|e| format!("Failed to create storage directory: {}", e))?;
 
     tracing::info!("Storage directory: {}", storage_dir.display());
 
-    let state = state::AppStateInner::new(args.api_key, storage_dir);
+    let state = state::AppStateRw::new(args.api_key, storage_dir);
 
-    let app = mgmt::management_router(state.clone());
+    let app = routes::management_router(state.clone());
 
-    let addr: SocketAddr = args.bind.parse().expect("Invalid bind address");
+    let addr: SocketAddr = args.bind.parse()
+        .map_err(|e| format!("Invalid bind address '{}': {}", args.bind, e))?;
     tracing::info!("Management API listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("Failed to bind");
-    axum::serve(listener, app).await.expect("Server error");
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
+    axum::serve(listener, app).await
+        .map_err(|e| format!("Server error: {}", e))?;
+
+    Ok(())
 }

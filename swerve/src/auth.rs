@@ -4,6 +4,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use subtle::ConstantTimeEq;
 
 use swerve_core::api::API_KEY_HEADER;
 
@@ -14,13 +15,21 @@ pub async fn api_key_auth(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let api_key = request
+    let provided = request
         .headers()
         .get(API_KEY_HEADER)
         .and_then(|v| v.to_str().ok());
 
-    match api_key {
-        Some(key) if key == state.api_key => Ok(next.run(request).await),
+    match provided {
+        Some(key) => {
+            let expected = state.api_key().as_bytes();
+            let given = key.as_bytes();
+            if expected.len() == given.len() && expected.ct_eq(given).into() {
+                Ok(next.run(request).await)
+            } else {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }

@@ -7,9 +7,19 @@ use axum::{
 };
 use std::net::SocketAddr;
 
-use crate::state::{AppState, SocketHandle};
+use crate::state::{AppState, SocketHandle, SocketStatus};
 
-/// Spawn a new HTTP listener that serves swerve files
+/// Sanitize a filename for Content-Disposition
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '"' | '\\' | '/' | '\n' | '\r' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
 pub async fn spawn_serve_listener(
     state: AppState,
     addr: &str,
@@ -25,19 +35,21 @@ pub async fn spawn_serve_listener(
 
     let handle = tokio::spawn(async move {
         tracing::info!("Swerve socket serving on {}", addr_string);
-        axum::serve(listener, app)
+        if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
             .await
-            .ok();
+        {
+            tracing::error!("Swerve socket on {} error: {}", addr_string, e);
+        }
         tracing::info!("Swerve socket on {} stopped", addr_string);
     });
 
     Ok(SocketHandle {
         shutdown_tx: Some(shutdown_tx),
         handle,
-        addr: addr.to_string(),
+        status: SocketStatus::Running,
     })
 }
 
@@ -51,31 +63,29 @@ async fn serve_file(
     State(state): State<AppState>,
     Path(filename): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let files = state.files.read().await;
-
-    // Find file by serve_name that is actively being served
-    let managed = files
-        .values()
-        .find(|f| f.info.serving && f.info.serve_name == filename)
+    // O(1) lookup via serve_name index
+    let (storage_name, key) = state
+        .get_file_for_serving(&filename)
+        .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let file_path = state.storage_dir.join(&managed.info.storage_name);
-    let key = managed.key.clone();
-    let serve_name = managed.info.serve_name.clone();
-    drop(files);
+    let file_path = state.storage_dir().join(&storage_name);
 
     let encrypted = tokio::fs::read(&file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let decrypted = key
-        .decrypt(&encrypted)
+    // Decrypt in blocking task
+    let decrypted = tokio::task::spawn_blocking(move || key.decrypt(&encrypted))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let safe_name = sanitize_filename(&filename);
     let headers = [
         (
             axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", serve_name),
+            format!("attachment; filename=\"{}\"", safe_name),
         ),
         (
             axum::http::header::CONTENT_TYPE,

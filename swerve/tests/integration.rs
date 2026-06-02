@@ -1,0 +1,474 @@
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use serde_json;
+use swerve::routes::management_router;
+use swerve::state::{AppState, AppStateRw, SocketHandle, SocketStatus};
+use swerve_core::api::*;
+use swerve_core::types::SwerveFile;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+const API_KEY: &str = "test-key";
+const MAX_RESPONSE: usize = 4 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+struct Harness {
+    app: axum::Router,
+    state: AppState,
+    _tmp: TempDir,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let state = AppStateRw::new(API_KEY.to_string(), tmp.path().to_path_buf());
+        let app = management_router(state.clone());
+        Self {
+            app,
+            state,
+            _tmp: tmp,
+        }
+    }
+
+    async fn send(&self, req: Request<Body>) -> axum::http::Response<Body> {
+        self.app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// Upload a file via multipart POST /files (authenticated).
+    async fn upload(&self, filename: &str, data: &[u8], serve_name: Option<&str>) -> StatusCode {
+        let (ct, body) = multipart_upload_body(filename, data, serve_name);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/files")
+            .header("x-api-key", API_KEY)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap();
+        self.send(req).await.status()
+    }
+}
+
+/// Build a multipart/form-data body for a file upload.
+fn multipart_upload_body(
+    filename: &str,
+    data: &[u8],
+    serve_name: Option<&str>,
+) -> (String, Vec<u8>) {
+    let boundary = "test-boundary-xyz";
+    let mut body = Vec::new();
+
+    // file part
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+
+    // optional serve_name part
+    if let Some(sn) = serve_name {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"serve_name\"\r\n\r\n");
+        body.extend_from_slice(sn.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    (content_type, body)
+}
+
+async fn json_body<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Body>) -> T {
+    let bytes = to_bytes(resp.into_body(), MAX_RESPONSE).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn raw_body(resp: axum::http::Response<Body>) -> Vec<u8> {
+    to_bytes(resp.into_body(), MAX_RESPONSE)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// 1. Health endpoint (no auth required)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_no_auth() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: StatusResponse = json_body(resp).await;
+    assert!(body.ok);
+}
+
+// ---------------------------------------------------------------------------
+// 2–4. Authentication
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_rejects_missing_key() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .uri("/files")
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_rejects_wrong_key() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", "wrong-key")
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_accepts_valid_key() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Upload then list
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_and_list() {
+    let h = Harness::new();
+    let status = h.upload("hello.bin", b"payload", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list: FileListResponse = json_body(resp).await;
+    assert_eq!(list.files.len(), 1);
+    assert_eq!(list.files[0].real_name, "hello.bin");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Upload then download — full round-trip through encryption
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_and_download_roundtrip() {
+    let h = Harness::new();
+    let data = b"round-trip payload 123";
+    let status = h.upload("rt.bin", data, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/files/rt.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = raw_body(resp).await;
+    assert_eq!(body, data);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Upload overwrite — same filename replaces previous contents
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_overwrite() {
+    let h = Harness::new();
+
+    h.upload("over.bin", b"first", None).await;
+    h.upload("over.bin", b"second", None).await;
+
+    // list should still have exactly one entry
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: FileListResponse = json_body(h.send(req).await).await;
+    assert_eq!(list.files.len(), 1);
+
+    // download should return the second payload
+    let req = Request::builder()
+        .uri("/files/over.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let body = raw_body(h.send(req).await).await;
+    assert_eq!(body, b"second");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Download non-existent file → 404
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn download_not_found() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .uri("/files/nonexistent.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Destroy file — DELETE then verify gone
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn destroy_file() {
+    let h = Harness::new();
+    h.upload("doomed.bin", b"bye", None).await;
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/files/doomed.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // subsequent download should 404
+    let req = Request::builder()
+        .uri("/files/doomed.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Serve-state toggle
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn serve_state_toggle() {
+    let h = Harness::new();
+    h.upload("toggle.bin", b"data", None).await;
+
+    // enable serving
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/toggle.bin/serve-state")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serving":true}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // verify via list
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: FileListResponse = json_body(h.send(req).await).await;
+    assert!(list.files.iter().any(|f| f.real_name == "toggle.bin" && f.serving));
+
+    // disable serving
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/toggle.bin/serve-state")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serving":false}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: FileListResponse = json_body(h.send(req).await).await;
+    assert!(list.files.iter().any(|f| f.real_name == "toggle.bin" && !f.serving));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Serve-name conflict — two files with same serve_name cannot both serve
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn serve_name_conflict() {
+    let h = Harness::new();
+
+    h.upload("file_a.bin", b"aaa", Some("shared.exe")).await;
+    h.upload("file_b.bin", b"bbb", Some("shared.exe")).await;
+
+    // enable serving for file_a → OK
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/file_a.bin/serve-state")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serving":true}"#))
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::OK);
+
+    // enable serving for file_b → conflict
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/file_b.bin/serve-state")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serving":true}"#))
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Set serve name
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_serve_name() {
+    let h = Harness::new();
+    h.upload("rename.bin", b"data", Some("old.exe")).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/rename.bin/serve-name")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serve_name":"new.exe"}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // verify the name changed
+    let req = Request::builder()
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: FileListResponse = json_body(h.send(req).await).await;
+    let file: &SwerveFile = list
+        .files
+        .iter()
+        .find(|f| f.real_name == "rename.bin")
+        .expect("file should exist");
+    assert_eq!(file.serve_name, "new.exe");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Socket bind → list → unbind
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn socket_bind_list_unbind() {
+    let h = Harness::new();
+
+    // bind a socket on a random available port
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sockets")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"addr":"127.0.0.1:0"}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // list should show one socket
+    let req = Request::builder()
+        .uri("/sockets")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: SocketListResponse = json_body(h.send(req).await).await;
+    assert_eq!(list.sockets.len(), 1);
+    assert_eq!(list.sockets[0].addr, "127.0.0.1:0");
+
+    // unbind it
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/sockets?addr=127.0.0.1:0")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // list should be empty now
+    let req = Request::builder()
+        .uri("/sockets")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let list: SocketListResponse = json_body(h.send(req).await).await;
+    assert!(list.sockets.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 14. Socket bind limit — pre-fill state, then try one more via HTTP
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn socket_bind_limit() {
+    let h = Harness::new();
+
+    // Pre-fill MAX_SWERVE_SOCKETS dummy entries via the state API directly.
+    // We don't actually bind real listeners — we just need the count to hit the cap.
+    for i in 0..MAX_SWERVE_SOCKETS {
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async {});
+        h.state
+            .insert_socket(
+                format!("dummy:{i}"),
+                SocketHandle {
+                    shutdown_tx: Some(tx),
+                    handle,
+                    status: SocketStatus::Running,
+                },
+            )
+            .await;
+    }
+
+    // Now trying to bind one more via the API should fail
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sockets")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"addr":"127.0.0.1:0"}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}

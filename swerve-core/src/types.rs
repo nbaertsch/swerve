@@ -34,3 +34,60 @@ pub fn storage_name_for(real_name: &str) -> String {
     hasher.update(real_name.as_bytes());
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_name_is_deterministic() {
+        let name = "test.bin";
+        assert_eq!(storage_name_for(name), storage_name_for(name));
+    }
+
+    #[test]
+    fn storage_name_differs_for_different_inputs() {
+        assert_ne!(storage_name_for("file1.bin"), storage_name_for("file2.bin"));
+    }
+
+    #[test]
+    fn storage_name_is_valid_hex() {
+        let result = storage_name_for("test");
+        assert_eq!(result.len(), 64);
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn storage_name_matches_known_sha256() {
+        // SHA-256 of "hello"
+        let result = storage_name_for("hello");
+        assert_eq!(
+            result,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn storage_name_handles_unicode() {
+        let result = storage_name_for("日本語ファイル.txt");
+        assert_eq!(result.len(), 64);
+    }
+
+    #[test]
+    fn swerve_file_serde_roundtrip() {
+        let file = SwerveFile {
+            real_name: "test.bin".to_string(),
+            storage_name: "abc123".to_string(),
+            serve_name: "update.exe".to_string(),
+            serving: true,
+            size: 1024,
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let deserialized: SwerveFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.real_name, file.real_name);
+        assert_eq!(deserialized.storage_name, file.storage_name);
+        assert_eq!(deserialized.serve_name, file.serve_name);
+        assert_eq!(deserialized.serving, file.serving);
+        assert_eq!(deserialized.size, file.size);
+    }
+}
