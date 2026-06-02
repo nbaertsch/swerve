@@ -1,0 +1,3 @@
+[workspace]
+members = ["swerve", "fswerve", "swerve-core"]
+resolver = "2"
