@@ -5,8 +5,9 @@ mod output;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
+use colored::Colorize;
 use output::OutputConfig;
-use std::io;
+use std::{io, path::Path};
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +20,7 @@ async fn main() {
     };
 
     if let Err(e) = run(cli, &out).await {
-        output::print_error(&e.to_string());
+        output::print_error_json(&e.to_string(), &out);
         std::process::exit(1);
     }
 }
@@ -29,6 +30,7 @@ fn make_client(
     api_key: Option<&str>,
     verbose: bool,
 ) -> Result<client::SwerveClient, Box<dyn std::error::Error>> {
+    // Config I/O is intentionally blocking here because the file is tiny and local.
     let cfg = config::resolve_config(server_url, api_key)?;
     Ok(client::SwerveClient::new(&cfg, verbose))
 }
@@ -73,6 +75,13 @@ async fn run(cli: cli::Cli, out: &OutputConfig) -> Result<(), Box<dyn std::error
         cli::Commands::Download(args) => {
             let client = make_client(server_url.as_deref(), api_key.as_deref(), verbose)?;
             let output_path = args.output.as_deref().unwrap_or(&args.real_name);
+            if Path::new(output_path).exists() && !out.quiet {
+                eprintln!(
+                    "{} Local file '{}' will be overwritten",
+                    "[!]".yellow().bold(),
+                    output_path
+                );
+            }
             client.download_file(&args.real_name, output_path).await?;
             output::print_success(
                 &format!("Downloaded '{}' to '{}'", args.real_name, output_path),
@@ -85,7 +94,8 @@ async fn run(cli: cli::Cli, out: &OutputConfig) -> Result<(), Box<dyn std::error
                 eprint!("Permanently delete '{}' from the server? [y/N] ", args.real_name);
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
+                let answer = input.trim().to_ascii_lowercase();
+                if answer != "y" && answer != "yes" {
                     eprintln!("Aborted.");
                     return Ok(());
                 }

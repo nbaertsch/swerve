@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -14,8 +14,8 @@ pub struct ManagedFile {
 #[derive(Debug)]
 pub enum SocketStatus {
     Running,
-    _Stopped,
-    _Error(String),
+    Stopped,
+    Error(String),
 }
 
 pub struct SocketHandle {
@@ -80,6 +80,27 @@ impl AppStateRw {
         Ok(old)
     }
 
+    /// Atomically finalize an upload on disk and update in-memory state.
+    pub async fn upload_file_atomic(
+        &self,
+        temp_path: &Path,
+        final_path: &Path,
+        storage_name: String,
+        managed: ManagedFile,
+    ) -> Result<Option<ManagedFile>, String> {
+        let mut inner = self.inner.write().await;
+        tokio::fs::rename(temp_path, final_path)
+            .await
+            .map_err(|e| format!("Failed to finalize file: {}", e))?;
+        let old = inner.files.insert(storage_name, managed);
+        if let Some(ref old_file) = old {
+            if old_file.info.serving {
+                inner.serve_index.remove(&old_file.info.serve_name);
+            }
+        }
+        Ok(old)
+    }
+
     /// Remove a file by storage_name
     pub async fn remove_file(&self, storage_name: &str) -> Option<ManagedFile> {
         let mut inner = self.inner.write().await;
@@ -112,7 +133,6 @@ impl AppStateRw {
         let was_serving = file.info.serving;
 
         if serving && !was_serving {
-            // Check for conflicts
             if let Some(existing) = inner.serve_index.get(&serve_name) {
                 if existing != storage_name {
                     return Err("Serve name is already in use by another file".to_string());
@@ -123,7 +143,10 @@ impl AppStateRw {
             inner.serve_index.remove(&serve_name);
         }
 
-        let file = inner.files.get_mut(storage_name).unwrap();
+        let file = inner
+            .files
+            .get_mut(storage_name)
+            .ok_or_else(|| "Internal error: file disappeared under write lock".to_string())?;
         file.info.serving = serving;
         Ok(())
     }
@@ -135,7 +158,6 @@ impl AppStateRw {
         let old_serve_name = file.info.serve_name.clone();
         let is_serving = file.info.serving;
 
-        // Check conflicts only if actively serving
         if is_serving {
             if let Some(existing) = inner.serve_index.get(&new_serve_name) {
                 if existing != storage_name {
@@ -146,7 +168,10 @@ impl AppStateRw {
             inner.serve_index.insert(new_serve_name.clone(), storage_name.to_string());
         }
 
-        let file = inner.files.get_mut(storage_name).unwrap();
+        let file = inner
+            .files
+            .get_mut(storage_name)
+            .ok_or_else(|| "Internal error: file disappeared under write lock".to_string())?;
         file.info.serve_name = new_serve_name;
         Ok(())
     }
@@ -180,18 +205,48 @@ impl AppStateRw {
         inner.sockets.insert(addr, handle);
     }
 
+    pub async fn try_insert_socket(
+        &self,
+        addr: String,
+        handle: SocketHandle,
+    ) -> Result<(), (SocketHandle, String)> {
+        let mut inner = self.inner.write().await;
+        if inner.sockets.len() >= swerve_core::api::MAX_SWERVE_SOCKETS {
+            return Err((
+                handle,
+                format!(
+                    "Maximum number of swerve sockets ({}) reached",
+                    swerve_core::api::MAX_SWERVE_SOCKETS
+                ),
+            ));
+        }
+        if inner.sockets.contains_key(&addr) {
+            return Err((handle, format!("Socket '{}' already bound", addr)));
+        }
+        inner.sockets.insert(addr, handle);
+        Ok(())
+    }
+
     pub async fn remove_socket(&self, addr: &str) -> Option<SocketHandle> {
         let mut inner = self.inner.write().await;
         inner.sockets.remove(addr)
     }
 
+    pub async fn update_socket_status(&self, addr: &str, status: SocketStatus) {
+        let mut inner = self.inner.write().await;
+        if let Some(socket) = inner.sockets.get_mut(addr) {
+            socket.status = status;
+        }
+    }
+
     pub async fn list_sockets(&self) -> Vec<SwerveSocket> {
         let inner = self.inner.read().await;
-        inner.sockets.iter().map(|(addr, h)| {
-            SwerveSocket {
+        inner.sockets
+            .iter()
+            .map(|(addr, h)| SwerveSocket {
                 addr: addr.clone(),
                 active: matches!(h.status, SocketStatus::Running),
-            }
-        }).collect()
+            })
+            .collect()
     }
 }

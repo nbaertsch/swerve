@@ -1,6 +1,10 @@
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, State},
+    body::Bytes,
+    extract::{
+        Multipart, Path, State,
+        multipart::MultipartRejection,
+    },
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
@@ -31,9 +35,11 @@ async fn list_files(State(state): State<AppState>) -> Json<FileListResponse> {
 
 async fn upload_file(
     State(state): State<AppState>,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> AppResult<Json<StatusResponse>> {
-    let mut file_data: Option<(String, Vec<u8>)> = None;
+    let mut multipart = multipart
+        .map_err(|e| AppError::bad_request(format!("Invalid multipart data: {}", e)))?;
+    let mut file_data: Option<(String, Bytes)> = None;
     let mut serve_name: Option<String> = None;
 
     loop {
@@ -46,7 +52,7 @@ async fn upload_file(
                         let data = field.bytes().await.map_err(|e| {
                             AppError::bad_request(format!("Failed to read file data: {}", e))
                         })?;
-                        file_data = Some((real_name, data.to_vec()));
+                        file_data = Some((real_name, data));
                     }
                     "serve_name" => {
                         let text = field.text().await.map_err(|e| {
@@ -86,13 +92,6 @@ async fn upload_file(
         AppError::internal(format!("Failed to write file: {}", e))
     })?;
 
-    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
-        // Clean up temp file on failure
-        let tp = temp_path.clone();
-        tokio::spawn(async move { let _ = tokio::fs::remove_file(tp).await; });
-        return Err(AppError::internal(format!("Failed to finalize file: {}", e)));
-    }
-
     let managed = ManagedFile {
         info: SwerveFile {
             real_name: real_name.clone(),
@@ -104,7 +103,16 @@ async fn upload_file(
         key,
     };
 
-    state.upload_file(storage_name, managed).await.map_err(|e| AppError::internal(e))?;
+    if let Err(e) = state
+        .upload_file_atomic(&temp_path, &final_path, storage_name, managed)
+        .await
+    {
+        let tp = temp_path.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(tp).await;
+        });
+        return Err(AppError::internal(e));
+    }
 
     Ok(Json(StatusResponse::success(format!("Uploaded '{}'", real_name))))
 }
@@ -163,7 +171,13 @@ async fn destroy_file(
     }
 
     let file_path = state.storage_dir().join(&storage_name);
-    let _ = tokio::fs::remove_file(&file_path).await;
+    if let Err(e) = tokio::fs::remove_file(&file_path).await {
+        tracing::warn!(
+            "Failed to delete file from disk at {}: {}",
+            file_path.display(),
+            e
+        );
+    }
 
     Ok(Json(StatusResponse::success(format!("Destroyed '{}'", real_name))))
 }

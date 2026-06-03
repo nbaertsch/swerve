@@ -23,34 +23,49 @@ fn sanitize_filename(name: &str) -> String {
 pub async fn spawn_serve_listener(
     state: AppState,
     addr: &str,
-) -> Result<SocketHandle, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(SocketHandle, String), Box<dyn std::error::Error + Send + Sync>> {
     let addr_parsed: SocketAddr = addr.parse()?;
-    let addr_string = addr.to_string();
-
     let listener = tokio::net::TcpListener::bind(addr_parsed).await?;
+    let actual_addr = listener.local_addr()?.to_string();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let app = serve_router(state.clone());
+    let state_clone = state.clone();
+    let addr_for_status = actual_addr.clone();
 
     let handle = tokio::spawn(async move {
-        tracing::info!("Swerve socket serving on {}", addr_string);
-        if let Err(e) = axum::serve(listener, app)
+        tracing::info!("Swerve socket serving on {}", addr_for_status);
+        let result = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
-            .await
-        {
-            tracing::error!("Swerve socket on {} error: {}", addr_string, e);
+            .await;
+
+        match result {
+            Ok(()) => {
+                tracing::info!("Swerve socket on {} stopped", addr_for_status);
+                state_clone
+                    .update_socket_status(&addr_for_status, SocketStatus::Stopped)
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!("Swerve socket on {} error: {}", addr_for_status, e);
+                state_clone
+                    .update_socket_status(&addr_for_status, SocketStatus::Error(e.to_string()))
+                    .await;
+            }
         }
-        tracing::info!("Swerve socket on {} stopped", addr_string);
     });
 
-    Ok(SocketHandle {
-        shutdown_tx: Some(shutdown_tx),
-        handle,
-        status: SocketStatus::Running,
-    })
+    Ok((
+        SocketHandle {
+            shutdown_tx: Some(shutdown_tx),
+            handle,
+            status: SocketStatus::Running,
+        },
+        actual_addr,
+    ))
 }
 
 fn serve_router(state: AppState) -> Router {
@@ -63,7 +78,6 @@ async fn serve_file(
     State(state): State<AppState>,
     Path(filename): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // O(1) lookup via serve_name index
     let (storage_name, key) = state
         .get_file_for_serving(&filename)
         .await
@@ -75,7 +89,6 @@ async fn serve_file(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Decrypt in blocking task
     let decrypted = tokio::task::spawn_blocking(move || key.decrypt(&encrypted))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

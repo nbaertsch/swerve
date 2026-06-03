@@ -18,10 +18,9 @@ pub fn init_color(no_color: bool) {
 }
 
 pub fn print_success(msg: &str, out: &OutputConfig) {
-    if out.quiet { return; }
     if out.json {
         println!("{}", serde_json::json!({"ok": true, "message": msg}));
-    } else {
+    } else if !out.quiet {
         println!("{} {}", "[✓]".green().bold(), msg);
     }
 }
@@ -30,11 +29,17 @@ pub fn print_error(msg: &str) {
     eprintln!("{} {}", "[✗]".red().bold(), msg);
 }
 
+pub fn print_error_json(msg: &str, out: &OutputConfig) {
+    if out.json {
+        eprintln!("{}", serde_json::json!({"ok": false, "error": msg}));
+    } else {
+        print_error(msg);
+    }
+}
+
 pub fn print_status(status: &StatusResponse, out: &OutputConfig) {
     if out.json {
-        if !out.quiet || !status.ok {
-            println!("{}", serde_json::to_string(status).unwrap_or_default());
-        }
+        println!("{}", serde_json::to_string(status).unwrap_or_default());
         return;
     }
     if status.ok {
@@ -52,6 +57,9 @@ pub fn print_config(config: &Config, out: &OutputConfig) {
         }));
         return;
     }
+    if out.quiet {
+        return;
+    }
     println!("{}", "fswerve configuration".bold().underline());
     println!("  {} {}", "Server URL:".cyan(), config.server_url);
     println!("  {} {}", "API Key:   ".cyan(), mask_key(&config.api_key));
@@ -62,16 +70,17 @@ pub fn print_file_list(files: &[SwerveFile], out: &OutputConfig) {
         println!("{}", serde_json::to_string_pretty(files).unwrap_or_default());
         return;
     }
+    if out.quiet {
+        return;
+    }
     if files.is_empty() {
-        if !out.quiet {
-            println!("{}", "No files on server.".dimmed());
-        }
+        println!("{}", "No files on server.".dimmed());
         return;
     }
 
     // Dynamic column widths
-    let rn_width = files.iter().map(|f| f.real_name.len()).max().unwrap_or(9).max(9).min(40);
-    let sn_width = files.iter().map(|f| f.serve_name.len()).max().unwrap_or(10).max(10).min(40);
+    let rn_width = files.iter().map(|f| f.real_name.len()).max().unwrap_or(9).clamp(9, 40);
+    let sn_width = files.iter().map(|f| f.serve_name.len()).max().unwrap_or(10).clamp(10, 40);
 
     println!(
         "{:<rn_width$}  {:<sn_width$}  {:>10}  {}",
@@ -102,10 +111,11 @@ pub fn print_socket_list(sockets: &[SwerveSocket], out: &OutputConfig) {
         println!("{}", serde_json::to_string_pretty(sockets).unwrap_or_default());
         return;
     }
+    if out.quiet {
+        return;
+    }
     if sockets.is_empty() {
-        if !out.quiet {
-            println!("{}", "No active swerve sockets.".dimmed());
-        }
+        println!("{}", "No active swerve sockets.".dimmed());
         return;
     }
 
@@ -121,20 +131,24 @@ pub fn print_socket_list(sockets: &[SwerveSocket], out: &OutputConfig) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else if max > 3 {
-        format!("{}...", &s[..max - 3])
+        let truncated: String = s.chars().take(max - 3).collect();
+        format!("{}...", truncated)
     } else {
-        s[..max].to_string()
+        s.chars().take(max).collect()
     }
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 4 {
+    let char_count = key.chars().count();
+    if char_count <= 4 {
         "****".to_string()
     } else {
-        format!("{}****", &key[..4])
+        let prefix: String = key.chars().take(4).collect();
+        format!("{}****", prefix)
     }
 }
 
@@ -190,6 +204,13 @@ mod tests {
         assert_eq!(truncate("", 5), "");
     }
 
+    #[test]
+    fn truncate_unicode_no_panic() {
+        let s = "🔥🔥🔥🔥🔥🔥";
+        let result = truncate(s, 5);
+        assert_eq!(result, "🔥🔥...");
+    }
+
     // --- mask_key ---
 
     #[test]
@@ -207,6 +228,13 @@ mod tests {
     #[test]
     fn mask_key_empty() {
         assert_eq!(mask_key(""), "****");
+    }
+
+    #[test]
+    fn mask_key_unicode_no_panic() {
+        let key = "🔑🔑🔑🔑🔑extra";
+        let result = mask_key(key);
+        assert_eq!(result, "🔑🔑🔑🔑****");
     }
 
     // --- human_size ---

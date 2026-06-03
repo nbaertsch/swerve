@@ -22,13 +22,24 @@ pub fn save_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let path = config_path()?;
     let toml_str = toml::to_string_pretty(config)?;
-    std::fs::write(&path, toml_str)?;
 
-    // Restrict permissions on Unix
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(toml_str.as_bytes())?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, toml_str)?;
     }
 
     Ok(())
@@ -52,7 +63,17 @@ pub fn resolve_config(
     server_url_override: Option<&str>,
     api_key_override: Option<&str>,
 ) -> Result<Config, Box<dyn std::error::Error>> {
-    let base = load_config().ok();
+    let base = match load_config() {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            let path = config_path().ok();
+            let file_exists = path.as_ref().is_some_and(|p| p.exists());
+            if file_exists {
+                return Err(format!("Failed to read config file: {}", e).into());
+            }
+            None
+        }
+    };
 
     let server_url = server_url_override
         .map(|s| s.to_string())
