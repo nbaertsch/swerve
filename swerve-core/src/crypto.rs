@@ -5,43 +5,51 @@ use aes_gcm::{
 use rand::RngCore;
 use zeroize::Zeroize;
 
-/// AES-256-GCM encryption key and nonce pair.
+/// AES-256-GCM encryption key.
 /// Key material is zeroized on drop.
 #[derive(Clone)]
 pub struct FileKey {
     key: [u8; 32],
-    nonce: [u8; 12],
 }
 
 impl Drop for FileKey {
     fn drop(&mut self) {
         self.key.zeroize();
-        self.nonce.zeroize();
     }
 }
 
 impl FileKey {
-    /// Generate a new random key and nonce
+    /// Generate a new random key
     pub fn generate() -> Self {
         let mut key = [0u8; 32];
-        let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut key);
-        OsRng.fill_bytes(&mut nonce);
-        Self { key, nonce }
+        Self { key }
     }
 
-    /// Encrypt plaintext data
+    /// Encrypt plaintext data with a fresh random nonce prepended to the ciphertext
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key));
-        let nonce = Nonce::from_slice(&self.nonce);
-        cipher.encrypt(nonce, data)
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, data)?;
+
+        let mut output = Vec::with_capacity(12 + ciphertext.len());
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&ciphertext);
+        Ok(output)
     }
 
-    /// Decrypt ciphertext data
+    /// Decrypt ciphertext data with the nonce stored in the first 12 bytes
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
+        if data.len() < 12 {
+            return Err(aes_gcm::Error);
+        }
+
+        let (nonce_bytes, ciphertext) = data.split_at(12);
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key));
-        let nonce = Nonce::from_slice(&self.nonce);
-        cipher.decrypt(nonce, data)
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher.decrypt(nonce, ciphertext)
     }
 }
 

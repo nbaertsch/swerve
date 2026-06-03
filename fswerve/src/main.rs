@@ -7,7 +7,10 @@ use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use colored::Colorize;
 use output::OutputConfig;
-use std::{io, path::Path};
+use std::{
+    io::{self, IsTerminal},
+    path::Path,
+};
 
 #[tokio::main]
 async fn main() {
@@ -33,6 +36,24 @@ fn make_client(
     // Config I/O is intentionally blocking here because the file is tiny and local.
     let cfg = config::resolve_config(server_url, api_key)?;
     Ok(client::SwerveClient::new(&cfg, verbose))
+}
+
+fn sanitize_download_output_path(real_name: &str, out: &OutputConfig) -> String {
+    let path = Path::new(real_name);
+    let basename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+
+    if basename != real_name && !out.quiet {
+        eprintln!(
+            "{} Filename contains path separators; saving as '{}'",
+            "[!]".yellow().bold(),
+            basename
+        );
+    }
+
+    basename
 }
 
 async fn run(cli: cli::Cli, out: &OutputConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -74,23 +95,36 @@ async fn run(cli: cli::Cli, out: &OutputConfig) -> Result<(), Box<dyn std::error
         }
         cli::Commands::Download(args) => {
             let client = make_client(server_url.as_deref(), api_key.as_deref(), verbose)?;
-            let output_path = args.output.as_deref().unwrap_or(&args.real_name);
-            if Path::new(output_path).exists() && !out.quiet {
-                eprintln!(
-                    "{} Local file '{}' will be overwritten",
-                    "[!]".yellow().bold(),
-                    output_path
+            let output_path = match args.output.as_deref() {
+                Some(path) => path.to_string(),
+                None => sanitize_download_output_path(&args.real_name, out),
+            };
+
+            if output_path == "-" {
+                client.download_file_to_stdout(&args.real_name).await?;
+            } else {
+                if Path::new(&output_path).exists() && !out.quiet {
+                    eprintln!(
+                        "{} Local file '{}' will be overwritten",
+                        "[!]".yellow().bold(),
+                        output_path
+                    );
+                }
+                client.download_file(&args.real_name, &output_path).await?;
+                output::print_success(
+                    &format!("Downloaded '{}' to '{}'", args.real_name, output_path),
+                    out,
                 );
             }
-            client.download_file(&args.real_name, output_path).await?;
-            output::print_success(
-                &format!("Downloaded '{}' to '{}'", args.real_name, output_path),
-                out,
-            );
             Ok(())
         }
         cli::Commands::Destroy(args) => {
             if !args.yes {
+                if !io::stdin().is_terminal() {
+                    return Err(
+                        "Refusing to prompt on non-interactive stdin. Use --yes to confirm.".into(),
+                    );
+                }
                 eprint!("Permanently delete '{}' from the server? [y/N] ", args.real_name);
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -152,5 +186,41 @@ async fn run(cli: cli::Cli, out: &OutputConfig) -> Result<(), Box<dyn std::error
             generate(args.shell, &mut cmd, "fswerve", &mut io::stdout());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_download_output_path_keeps_basename() {
+        let out = OutputConfig {
+            json: false,
+            quiet: false,
+        };
+
+        assert_eq!(sanitize_download_output_path("payload.bin", &out), "payload.bin");
+    }
+
+    #[test]
+    fn sanitize_download_output_path_strips_traversal() {
+        let out = OutputConfig {
+            json: false,
+            quiet: true,
+        };
+
+        assert_eq!(sanitize_download_output_path("..\\..\\secret.txt", &out), "secret.txt");
+        assert_eq!(sanitize_download_output_path("../../secret.txt", &out), "secret.txt");
+    }
+
+    #[test]
+    fn sanitize_download_output_path_falls_back_for_empty_name() {
+        let out = OutputConfig {
+            json: false,
+            quiet: true,
+        };
+
+        assert_eq!(sanitize_download_output_path("", &out), "download");
     }
 }

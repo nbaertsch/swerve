@@ -36,6 +36,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&storage_dir).await
         .map_err(|e| format!("Failed to create storage directory: {}", e))?;
 
+    // Clean orphaned files from previous runs (state is ephemeral, keys are lost on restart)
+    let mut entries = tokio::fs::read_dir(&storage_dir).await
+        .map_err(|e| format!("Failed to read storage directory: {}", e))?;
+    let mut cleaned = 0u64;
+    while let Some(entry) = entries.next_entry().await
+        .map_err(|e| format!("Failed to read storage directory entry: {}", e))? {
+        if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+            cleaned += 1;
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!("Cleaned {} orphaned file(s) from previous run", cleaned);
+    }
+
     tracing::info!("Storage directory: {}", storage_dir.display());
 
     let state = state::AppStateRw::new(args.api_key, storage_dir);

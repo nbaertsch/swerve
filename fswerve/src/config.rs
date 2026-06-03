@@ -69,7 +69,11 @@ pub fn resolve_config(
             let path = config_path().ok();
             let file_exists = path.as_ref().is_some_and(|p| p.exists());
             if file_exists {
-                return Err(format!("Failed to read config file: {}", e).into());
+                let path_str = path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(format!("Failed to read config file at {}: {}", path_str, e).into());
             }
             None
         }

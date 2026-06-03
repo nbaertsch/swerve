@@ -6,10 +6,10 @@ use axum::{
     routing::get,
 };
 use std::net::SocketAddr;
+use tower::ServiceBuilder;
 
 use crate::state::{AppState, SocketHandle, SocketStatus};
 
-/// Sanitize a filename for Content-Disposition
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
@@ -71,6 +71,7 @@ pub async fn spawn_serve_listener(
 fn serve_router(state: AppState) -> Router {
     Router::new()
         .route("/{filename}", get(serve_file))
+        .layer(ServiceBuilder::new().concurrency_limit(32))
         .with_state(state)
 }
 
@@ -78,12 +79,12 @@ async fn serve_file(
     State(state): State<AppState>,
     Path(filename): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let (storage_name, key) = state
+    let (disk_name, key) = state
         .get_file_for_serving(&filename)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let file_path = state.storage_dir().join(&storage_name);
+    let file_path = state.storage_dir().join(&disk_name);
 
     let encrypted = tokio::fs::read(&file_path)
         .await

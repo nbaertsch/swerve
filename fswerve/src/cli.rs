@@ -73,10 +73,10 @@ pub enum Commands {
     /// Example: fswerve download payload.bin -o ./local_copy.bin
     Download(DownloadArgs),
 
-    /// Permanently delete a file from the server [requires --yes]
+    /// Permanently delete a file from the server
     ///
     /// Removes both the encrypted file from storage and all associated metadata.
-    /// This action cannot be undone. Use --yes to skip confirmation.
+    /// This action cannot be undone. Prompts for confirmation unless --yes is provided.
     ///
     /// Example: fswerve destroy payload.bin --yes
     #[command(alias = "delete", alias = "rm")]

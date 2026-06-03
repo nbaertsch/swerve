@@ -18,9 +18,12 @@ pub fn init_color(no_color: bool) {
 }
 
 pub fn print_success(msg: &str, out: &OutputConfig) {
+    if out.quiet {
+        return;
+    }
     if out.json {
         println!("{}", serde_json::json!({"ok": true, "message": msg}));
-    } else if !out.quiet {
+    } else {
         println!("{} {}", "[✓]".green().bold(), msg);
     }
 }
@@ -38,26 +41,36 @@ pub fn print_error_json(msg: &str, out: &OutputConfig) {
 }
 
 pub fn print_status(status: &StatusResponse, out: &OutputConfig) {
+    if status.ok && out.quiet {
+        return;
+    }
     if out.json {
-        println!("{}", serde_json::to_string(status).unwrap_or_default());
+        if status.ok {
+            println!("{}", serde_json::json!({"ok": true, "message": status.message}));
+        } else {
+            eprintln!("{}", serde_json::json!({"ok": false, "error": status.message}));
+        }
         return;
     }
     if status.ok {
-        print_success(&status.message, out);
+        println!("{} {}", "[✓]".green().bold(), &status.message);
     } else {
         print_error(&status.message);
     }
 }
 
 pub fn print_config(config: &Config, out: &OutputConfig) {
-    if out.json {
-        println!("{}", serde_json::json!({
-            "server_url": config.server_url,
-            "api_key": mask_key(&config.api_key),
-        }));
+    if out.quiet {
         return;
     }
-    if out.quiet {
+    if out.json {
+        println!("{}", serde_json::json!({
+            "ok": true,
+            "data": {
+                "server_url": &config.server_url,
+                "api_key": mask_key(&config.api_key),
+            }
+        }));
         return;
     }
     println!("{}", "fswerve configuration".bold().underline());
@@ -66,11 +79,11 @@ pub fn print_config(config: &Config, out: &OutputConfig) {
 }
 
 pub fn print_file_list(files: &[SwerveFile], out: &OutputConfig) {
-    if out.json {
-        println!("{}", serde_json::to_string_pretty(files).unwrap_or_default());
+    if out.quiet {
         return;
     }
-    if out.quiet {
+    if out.json {
+        println!("{}", serde_json::json!({"ok": true, "data": files}));
         return;
     }
     if files.is_empty() {
@@ -107,11 +120,11 @@ pub fn print_file_list(files: &[SwerveFile], out: &OutputConfig) {
 }
 
 pub fn print_socket_list(sockets: &[SwerveSocket], out: &OutputConfig) {
-    if out.json {
-        println!("{}", serde_json::to_string_pretty(sockets).unwrap_or_default());
+    if out.quiet {
         return;
     }
-    if out.quiet {
+    if out.json {
+        println!("{}", serde_json::json!({"ok": true, "data": sockets}));
         return;
     }
     if sockets.is_empty() {

@@ -45,20 +45,40 @@ async fn bind_socket(
     Json(body): Json<BindSocketRequest>,
 ) -> AppResult<Json<StatusResponse>> {
     let requested_addr = body.addr;
+    let _: std::net::SocketAddr = requested_addr
+        .parse()
+        .map_err(|e| AppError::bad_request(format!("Invalid address '{}': {}", requested_addr, e)))?;
 
-    let (handle, actual_addr) = serve::spawn_serve_listener(state.clone(), &requested_addr)
+    state
+        .reserve_socket_slot(&requested_addr)
         .await
-        .map_err(|e| AppError::internal(format!("Failed to bind socket: {}", e)))?;
+        .map_err(AppError::conflict)?;
 
-    if let Err((handle, message)) = state.try_insert_socket(actual_addr.clone(), handle).await {
-        shutdown_socket_handle(&actual_addr, handle).await;
-        return Err(AppError::conflict(message));
+    match serve::spawn_serve_listener(state.clone(), &requested_addr).await {
+        Ok((handle, actual_addr)) => {
+            if actual_addr != requested_addr {
+                state.cancel_socket_reservation(&requested_addr).await;
+                if let Err(msg) = state.reserve_socket_slot(&actual_addr).await {
+                    shutdown_socket_handle(&actual_addr, handle).await;
+                    return Err(AppError::conflict(msg));
+                }
+            }
+
+            if let Err(handle) = state.fulfill_socket_reservation(&actual_addr, handle).await {
+                shutdown_socket_handle(&actual_addr, handle).await;
+                return Err(AppError::conflict("Socket reservation was canceled before bind completed"));
+            }
+
+            Ok(Json(StatusResponse::success(format!(
+                "Bound swerve socket on {}",
+                actual_addr
+            ))))
+        }
+        Err(e) => {
+            state.cancel_socket_reservation(&requested_addr).await;
+            Err(AppError::internal(format!("Failed to bind socket: {}", e)))
+        }
     }
-
-    Ok(Json(StatusResponse::success(format!(
-        "Bound swerve socket on {}",
-        actual_addr
-    ))))
 }
 
 #[derive(serde::Deserialize)]

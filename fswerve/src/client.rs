@@ -121,11 +121,10 @@ impl SwerveClient {
         Ok(list.files)
     }
 
-    pub async fn download_file(
+    async fn download_file_bytes(
         &self,
         real_name: &str,
-        output_path: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let encoded = urlencoding::encode(real_name);
         let url = self.url(&format!("/files/{}", encoded));
         if self.verbose { eprintln!("GET {}", url); }
@@ -136,15 +135,36 @@ impl SwerveClient {
             .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if let Ok(sr) = serde_json::from_str::<StatusResponse>(&body) {
                 return Err(sr.message.into());
             }
-            return Err(format!("Server returned {}", body).into());
+            return Err(format!("Server returned {} — {}", status, body).into());
         }
 
-        let bytes = resp.bytes().await?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    pub async fn download_file(
+        &self,
+        real_name: &str,
+        output_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = self.download_file_bytes(real_name).await?;
         tokio::fs::write(output_path, bytes).await?;
+        Ok(())
+    }
+
+    pub async fn download_file_to_stdout(
+        &self,
+        real_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        let bytes = self.download_file_bytes(real_name).await?;
+        std::io::stdout().write_all(&bytes)?;
+        std::io::stdout().flush()?;
         Ok(())
     }
 

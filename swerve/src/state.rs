@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -9,10 +9,20 @@ use swerve_core::types::{SwerveFile, SwerveSocket};
 pub struct ManagedFile {
     pub info: SwerveFile,
     pub key: FileKey,
+    pub disk_name: String,
+}
+
+#[derive(Debug)]
+pub enum StateError {
+    NotFound,
+    ServeNameConflict,
+    Internal(&'static str),
+    Io(String),
 }
 
 #[derive(Debug)]
 pub enum SocketStatus {
+    Pending,
     Running,
     Stopped,
     Error(String),
@@ -64,79 +74,91 @@ impl AppStateRw {
 
     // -- File operations --
 
-    /// Upload a new file: insert atomically under one write lock
     pub async fn upload_file(
         &self,
         storage_name: String,
         managed: ManagedFile,
-    ) -> Result<Option<ManagedFile>, String> {
+    ) -> Result<Option<ManagedFile>, StateError> {
         let mut inner = self.inner.write().await;
-        let old = inner.files.insert(storage_name, managed);
-        if let Some(ref old_file) = old {
-            if old_file.info.serving {
-                inner.serve_index.remove(&old_file.info.serve_name);
-            }
+
+        if managed.info.serving
+            && let Some(existing) = inner.serve_index.get(&managed.info.serve_name)
+            && existing != &storage_name
+        {
+            return Err(StateError::ServeNameConflict);
         }
+
+        let old = inner.files.insert(storage_name.clone(), managed);
+        if let Some(ref old_file) = old && old_file.info.serving {
+            inner.serve_index.remove(&old_file.info.serve_name);
+        }
+        let new_serve_name = inner.files.get(&storage_name).and_then(|new_file| {
+            new_file
+                .info
+                .serving
+                .then(|| new_file.info.serve_name.clone())
+        });
+        if let Some(new_serve_name) = new_serve_name {
+            inner.serve_index.insert(new_serve_name, storage_name);
+        }
+
         Ok(old)
     }
 
-    /// Atomically finalize an upload on disk and update in-memory state.
-    pub async fn upload_file_atomic(
-        &self,
-        temp_path: &Path,
-        final_path: &Path,
-        storage_name: String,
-        managed: ManagedFile,
-    ) -> Result<Option<ManagedFile>, String> {
-        let mut inner = self.inner.write().await;
-        tokio::fs::rename(temp_path, final_path)
-            .await
-            .map_err(|e| format!("Failed to finalize file: {}", e))?;
-        let old = inner.files.insert(storage_name, managed);
-        if let Some(ref old_file) = old {
-            if old_file.info.serving {
-                inner.serve_index.remove(&old_file.info.serve_name);
-            }
-        }
-        Ok(old)
-    }
-
-    /// Remove a file by storage_name
     pub async fn remove_file(&self, storage_name: &str) -> Option<ManagedFile> {
         let mut inner = self.inner.write().await;
         let removed = inner.files.remove(storage_name);
-        if let Some(ref f) = removed {
-            if f.info.serving {
-                inner.serve_index.remove(&f.info.serve_name);
-            }
+        if let Some(ref f) = removed && f.info.serving {
+            inner.serve_index.remove(&f.info.serve_name);
         }
         removed
     }
 
-    /// Get file info + clone key for download (read lock)
-    pub async fn get_file_for_download(&self, storage_name: &str) -> Option<(SwerveFile, FileKey)> {
-        let inner = self.inner.read().await;
-        inner.files.get(storage_name).map(|f| (f.info.clone(), f.key.clone()))
+    pub async fn remove_file_if_disk_name(
+        &self,
+        storage_name: &str,
+        disk_name: &str,
+    ) -> Option<ManagedFile> {
+        let mut inner = self.inner.write().await;
+        if inner.files.get(storage_name)?.disk_name != disk_name {
+            return None;
+        }
+        let removed = inner.files.remove(storage_name);
+        if let Some(ref f) = removed && f.info.serving {
+            inner.serve_index.remove(&f.info.serve_name);
+        }
+        removed
     }
 
-    /// List all files
+    pub async fn get_disk_name(&self, storage_name: &str) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.files.get(storage_name).map(|f| f.disk_name.clone())
+    }
+
+    pub async fn get_file_for_download(
+        &self,
+        storage_name: &str,
+    ) -> Option<(SwerveFile, String, FileKey)> {
+        let inner = self.inner.read().await;
+        inner.files.get(storage_name).map(|f| {
+            (f.info.clone(), f.disk_name.clone(), f.key.clone())
+        })
+    }
+
     pub async fn list_files(&self) -> Vec<SwerveFile> {
         let inner = self.inner.read().await;
         inner.files.values().map(|f| f.info.clone()).collect()
     }
 
-    /// Set serve state for a file (atomically checks for conflicts)
-    pub async fn set_serve_state(&self, storage_name: &str, serving: bool) -> Result<(), String> {
+    pub async fn set_serve_state(&self, storage_name: &str, serving: bool) -> Result<(), StateError> {
         let mut inner = self.inner.write().await;
-        let file = inner.files.get(storage_name).ok_or("File not found")?;
+        let file = inner.files.get(storage_name).ok_or(StateError::NotFound)?;
         let serve_name = file.info.serve_name.clone();
         let was_serving = file.info.serving;
 
         if serving && !was_serving {
-            if let Some(existing) = inner.serve_index.get(&serve_name) {
-                if existing != storage_name {
-                    return Err("Serve name is already in use by another file".to_string());
-                }
+            if let Some(existing) = inner.serve_index.get(&serve_name) && existing != storage_name {
+                return Err(StateError::ServeNameConflict);
             }
             inner.serve_index.insert(serve_name, storage_name.to_string());
         } else if !serving && was_serving {
@@ -146,43 +168,44 @@ impl AppStateRw {
         let file = inner
             .files
             .get_mut(storage_name)
-            .ok_or_else(|| "Internal error: file disappeared under write lock".to_string())?;
+            .ok_or(StateError::Internal("File disappeared under write lock"))?;
         file.info.serving = serving;
         Ok(())
     }
 
-    /// Set serve name for a file (atomically checks for conflicts)
-    pub async fn set_serve_name(&self, storage_name: &str, new_serve_name: String) -> Result<(), String> {
+    pub async fn set_serve_name(
+        &self,
+        storage_name: &str,
+        new_serve_name: String,
+    ) -> Result<(), StateError> {
         let mut inner = self.inner.write().await;
-        let file = inner.files.get(storage_name).ok_or("File not found")?;
+        let file = inner.files.get(storage_name).ok_or(StateError::NotFound)?;
         let old_serve_name = file.info.serve_name.clone();
         let is_serving = file.info.serving;
 
         if is_serving {
-            if let Some(existing) = inner.serve_index.get(&new_serve_name) {
-                if existing != storage_name {
-                    return Err("Serve name is already in use by another file".to_string());
-                }
+            if let Some(existing) = inner.serve_index.get(&new_serve_name) && existing != storage_name {
+                return Err(StateError::ServeNameConflict);
             }
             inner.serve_index.remove(&old_serve_name);
-            inner.serve_index.insert(new_serve_name.clone(), storage_name.to_string());
+            inner.serve_index
+                .insert(new_serve_name.clone(), storage_name.to_string());
         }
 
         let file = inner
             .files
             .get_mut(storage_name)
-            .ok_or_else(|| "Internal error: file disappeared under write lock".to_string())?;
+            .ok_or(StateError::Internal("File disappeared under write lock"))?;
         file.info.serve_name = new_serve_name;
         Ok(())
     }
 
-    /// Look up a file by serve_name for serving (uses O(1) index)
     pub async fn get_file_for_serving(&self, serve_name: &str) -> Option<(String, FileKey)> {
         let inner = self.inner.read().await;
         let storage_name = inner.serve_index.get(serve_name)?;
         let file = inner.files.get(storage_name)?;
         if file.info.serving {
-            Some((file.info.storage_name.clone(), file.key.clone()))
+            Some((file.disk_name.clone(), file.key.clone()))
         } else {
             None
         }
@@ -205,26 +228,46 @@ impl AppStateRw {
         inner.sockets.insert(addr, handle);
     }
 
-    pub async fn try_insert_socket(
-        &self,
-        addr: String,
-        handle: SocketHandle,
-    ) -> Result<(), (SocketHandle, String)> {
+    pub async fn reserve_socket_slot(&self, addr: &str) -> Result<(), String> {
         let mut inner = self.inner.write().await;
         if inner.sockets.len() >= swerve_core::api::MAX_SWERVE_SOCKETS {
-            return Err((
-                handle,
-                format!(
-                    "Maximum number of swerve sockets ({}) reached",
-                    swerve_core::api::MAX_SWERVE_SOCKETS
-                ),
+            return Err(format!(
+                "Maximum number of swerve sockets ({}) reached",
+                swerve_core::api::MAX_SWERVE_SOCKETS
             ));
         }
-        if inner.sockets.contains_key(&addr) {
-            return Err((handle, format!("Socket '{}' already bound", addr)));
+        if inner.sockets.contains_key(addr) {
+            return Err(format!("Socket '{}' already bound", addr));
         }
-        inner.sockets.insert(addr, handle);
+        inner.sockets.insert(
+            addr.to_string(),
+            SocketHandle {
+                shutdown_tx: None,
+                handle: tokio::spawn(async {}),
+                status: SocketStatus::Pending,
+            },
+        );
         Ok(())
+    }
+
+    pub async fn fulfill_socket_reservation(
+        &self,
+        addr: &str,
+        handle: SocketHandle,
+    ) -> Result<(), SocketHandle> {
+        let mut inner = self.inner.write().await;
+        match inner.sockets.get(addr) {
+            Some(existing) if matches!(existing.status, SocketStatus::Pending) => {
+                inner.sockets.insert(addr.to_string(), handle);
+                Ok(())
+            }
+            _ => Err(handle),
+        }
+    }
+
+    pub async fn cancel_socket_reservation(&self, addr: &str) {
+        let mut inner = self.inner.write().await;
+        inner.sockets.remove(addr);
     }
 
     pub async fn remove_socket(&self, addr: &str) -> Option<SocketHandle> {

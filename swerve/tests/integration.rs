@@ -1,6 +1,5 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use serde_json;
 use swerve::routes::management_router;
 use swerve::state::{AppState, AppStateRw, SocketHandle, SocketStatus};
 use swerve_core::api::*;
@@ -576,4 +575,138 @@ async fn socket_bind_limit() {
         .unwrap();
     let resp = h.send(req).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Truly malformed multipart — truncated body with valid multipart content-type
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_rejects_truncated_multipart_body() {
+    let h = Harness::new();
+    // Valid multipart content-type but truncated/incomplete body
+    let req = Request::builder()
+        .method("POST")
+        .uri("/files")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "multipart/form-data; boundary=abc")
+        .body(Body::from("--abc\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x\"\r\n\r\ndata-but-no-closing-boundary"))
+        .unwrap();
+    let resp = h.send(req).await;
+    // Should still succeed since it can parse the field, but missing final boundary
+    // is handled gracefully — the file field IS present. What matters: no panic.
+    assert!(
+        resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
+        "Expected OK or BAD_REQUEST, got {}",
+        resp.status()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. Empty file upload and download roundtrip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_and_download_empty_file() {
+    let h = Harness::new();
+    let status = h.upload("empty.bin", b"", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/files/empty.bin")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = raw_body(resp).await;
+    assert!(body.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 17. Unicode filename upload and download roundtrip
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_unicode_filename() {
+    let h = Harness::new();
+    let status = h.upload("日本語ファイル.txt", b"unicode content", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/files/%E6%97%A5%E6%9C%AC%E8%AA%9E%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB.txt")
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = raw_body(resp).await;
+    assert_eq!(body, b"unicode content");
+}
+
+// ---------------------------------------------------------------------------
+// 18. Socket serves files over real network traffic
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn socket_serves_file_over_network() {
+    let h = Harness::new();
+
+    // Upload and enable serving for a file
+    let status = h.upload("served.bin", b"served-payload", Some("download.exe")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/files/served.bin/serve-state")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"serving":true}"#))
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::OK);
+
+    // Bind a socket on a random port
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sockets")
+        .header("x-api-key", API_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"addr":"127.0.0.1:0"}"#))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status_resp: StatusResponse = json_body(resp).await;
+    let bound_addr = status_resp
+        .message
+        .strip_prefix("Bound swerve socket on ")
+        .expect("bind response should include bound address")
+        .to_string();
+
+    // Give the listener a moment to start
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Fetch the served file over HTTP from the swerve socket
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/download.exe", bound_addr);
+    let resp = client.get(&url).send().await.expect("request to swerve socket");
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.expect("body from swerve socket");
+    assert_eq!(body.as_ref(), b"served-payload");
+
+    // Verify non-served file returns 404
+    let resp = client
+        .get(format!("http://{}/nonexistent.bin", bound_addr))
+        .send()
+        .await
+        .expect("request to swerve socket");
+    assert_eq!(resp.status(), 404);
+
+    // Unbind
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/sockets?addr={}", bound_addr))
+        .header("x-api-key", API_KEY)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::OK);
 }

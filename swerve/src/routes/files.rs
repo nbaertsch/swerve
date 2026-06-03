@@ -16,7 +16,20 @@ use swerve_core::{
 };
 
 use crate::error::{AppError, AppResult};
-use crate::state::{AppState, ManagedFile};
+use crate::state::{AppState, ManagedFile, StateError};
+
+impl From<StateError> for AppError {
+    fn from(e: StateError) -> Self {
+        match e {
+            StateError::NotFound => AppError::not_found("File not found"),
+            StateError::ServeNameConflict => {
+                AppError::conflict("Serve name is already in use by another file")
+            }
+            StateError::Internal(msg) => AppError::internal(msg),
+            StateError::Io(msg) => AppError::internal(msg),
+        }
+    }
+}
 
 pub fn file_routes() -> Router<AppState> {
     Router::new()
@@ -72,9 +85,9 @@ async fn upload_file(
 
     let serve_name = serve_name.unwrap_or_else(|| real_name.clone());
     let storage_name = storage_name_for(&real_name);
+    let disk_name = format!("{}-{}", storage_name, uuid::Uuid::new_v4());
     let file_size = data.len() as u64;
 
-    // Encrypt in a blocking task (CPU-intensive for large files)
     let key = FileKey::generate();
     let key_clone = key.clone();
     let encrypted = tokio::task::spawn_blocking(move || key_clone.encrypt(&data))
@@ -82,15 +95,10 @@ async fn upload_file(
         .map_err(|_| AppError::internal("Encryption task failed"))?
         .map_err(|_| AppError::internal("Encryption failed"))?;
 
-    // Atomic write: write to temp file, then rename
-    let storage_dir = state.storage_dir().clone();
-    let temp_name = format!(".tmp-{}", uuid::Uuid::new_v4());
-    let temp_path = storage_dir.join(&temp_name);
-    let final_path = storage_dir.join(&storage_name);
-
-    tokio::fs::write(&temp_path, &encrypted).await.map_err(|e| {
-        AppError::internal(format!("Failed to write file: {}", e))
-    })?;
+    let file_path = state.storage_dir().join(&disk_name);
+    tokio::fs::write(&file_path, &encrypted)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to write file: {}", e)))?;
 
     let managed = ManagedFile {
         info: SwerveFile {
@@ -101,23 +109,29 @@ async fn upload_file(
             size: file_size,
         },
         key,
+        disk_name: disk_name.clone(),
     };
 
-    if let Err(e) = state
-        .upload_file_atomic(&temp_path, &final_path, storage_name, managed)
-        .await
-    {
-        let tp = temp_path.clone();
+    let old = match state.upload_file(storage_name, managed).await {
+        Ok(old) => old,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return Err(e.into());
+        }
+    };
+
+    if let Some(old_file) = old {
+        let old_path = state.storage_dir().join(old_file.disk_name);
         tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(tp).await;
+            if let Err(e) = tokio::fs::remove_file(&old_path).await {
+                tracing::warn!("Failed to remove old file version at {}: {}", old_path.display(), e);
+            }
         });
-        return Err(AppError::internal(e));
     }
 
     Ok(Json(StatusResponse::success(format!("Uploaded '{}'", real_name))))
 }
 
-/// Sanitize a filename for use in Content-Disposition header
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
@@ -134,16 +148,17 @@ async fn download_file(
 ) -> AppResult<impl IntoResponse> {
     let storage_name = storage_name_for(&real_name);
 
-    let (info, key) = state.get_file_for_download(&storage_name).await
+    let (info, disk_name, key) = state
+        .get_file_for_download(&storage_name)
+        .await
         .ok_or_else(|| AppError::not_found(format!("File '{}' not found", real_name)))?;
 
-    let file_path = state.storage_dir().join(&storage_name);
+    let file_path = state.storage_dir().join(&disk_name);
 
-    let encrypted = tokio::fs::read(&file_path).await.map_err(|e| {
-        AppError::internal(format!("Failed to read file: {}", e))
-    })?;
+    let encrypted = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to read file: {}", e)))?;
 
-    // Decrypt in blocking task
     let decrypted = tokio::task::spawn_blocking(move || key.decrypt(&encrypted))
         .await
         .map_err(|_| AppError::internal("Decryption task failed"))?
@@ -151,8 +166,14 @@ async fn download_file(
 
     let safe_name = sanitize_filename(&info.real_name);
     let headers = [
-        (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", safe_name)),
-        (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", safe_name),
+        ),
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/octet-stream".to_string(),
+        ),
     ];
 
     Ok((headers, decrypted))
@@ -164,20 +185,20 @@ async fn destroy_file(
 ) -> AppResult<Json<StatusResponse>> {
     let storage_name = storage_name_for(&real_name);
 
-    let removed = state.remove_file(&storage_name).await;
+    let disk_name = state
+        .get_disk_name(&storage_name)
+        .await
+        .ok_or_else(|| AppError::not_found(format!("File '{}' not found", real_name)))?;
 
-    if removed.is_none() {
-        return Err(AppError::not_found(format!("File '{}' not found", real_name)));
-    }
+    let file_path = state.storage_dir().join(&disk_name);
+    tokio::fs::remove_file(&file_path)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to delete file from disk: {}", e)))?;
 
-    let file_path = state.storage_dir().join(&storage_name);
-    if let Err(e) = tokio::fs::remove_file(&file_path).await {
-        tracing::warn!(
-            "Failed to delete file from disk at {}: {}",
-            file_path.display(),
-            e
-        );
-    }
+    state
+        .remove_file_if_disk_name(&storage_name, &disk_name)
+        .await
+        .ok_or_else(|| AppError::conflict("File changed during destroy"))?;
 
     Ok(Json(StatusResponse::success(format!("Destroyed '{}'", real_name))))
 }
@@ -189,16 +210,13 @@ async fn set_serve_state(
 ) -> AppResult<Json<StatusResponse>> {
     let storage_name = storage_name_for(&real_name);
 
-    state.set_serve_state(&storage_name, body.serving).await.map_err(|msg| {
-        if msg == "File not found" {
-            AppError::not_found(format!("File '{}' not found", real_name))
-        } else {
-            AppError::conflict(msg)
-        }
-    })?;
+    state.set_serve_state(&storage_name, body.serving).await?;
 
     let state_str = if body.serving { "enabled" } else { "disabled" };
-    Ok(Json(StatusResponse::success(format!("Serving {} for '{}'", state_str, real_name))))
+    Ok(Json(StatusResponse::success(format!(
+        "Serving {} for '{}'",
+        state_str, real_name
+    ))))
 }
 
 async fn set_serve_name(
@@ -208,13 +226,9 @@ async fn set_serve_name(
 ) -> AppResult<Json<StatusResponse>> {
     let storage_name = storage_name_for(&real_name);
 
-    state.set_serve_name(&storage_name, body.serve_name.clone()).await.map_err(|msg| {
-        if msg == "File not found" {
-            AppError::not_found(format!("File '{}' not found", real_name))
-        } else {
-            AppError::conflict(msg)
-        }
-    })?;
+    state
+        .set_serve_name(&storage_name, body.serve_name.clone())
+        .await?;
 
     Ok(Json(StatusResponse::success(format!(
         "Serve name updated to '{}' for '{}'",
