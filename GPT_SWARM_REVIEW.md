@@ -1,7 +1,11 @@
-# Swerve Project — GPT Swarm Review Report
+# Swerve Project — GPT Swarm Review Reports
 
-> **5 GPT sub-agents** reviewed the swerve codebase in parallel.
+> **3 rounds** of GPT swarm reviews conducted. Each round uses 5 parallel GPT sub-agents.
 > Models used: GPT-5.4, GPT-5.2, GPT-5.4-mini
+
+---
+
+# Round 1 Review (Original)
 
 ---
 
@@ -151,3 +155,48 @@ These findings were flagged by **multiple agents** as the most important:
 8. **Stop deleting storage dir on startup** — use subdirectory or flag
 9. **Add P0 tests** — crypto round-trip, auth, upload/download, config
 10. **Add `--yes` to destroy** — prevent accidental deletion
+
+---
+
+# Round 3 Review (Post Round-2 Fixes)
+
+> 90 tests passing. All round 1+2 fixes verified by all 5 agents.
+
+## Findings Summary: 6 HIGH, 10 MEDIUM, 6 LOW
+
+### HIGH
+
+| # | Issue | Source |
+|---|-------|--------|
+| 1 | **Nonce reuse risk** — FileKey stores fixed nonce; public API allows encrypt() called twice → catastrophic AES-GCM break | Rust Idioms |
+| 2 | **Unauthenticated DoS on public swerve sockets** — full file buffered in RAM (2x 50MB/req, no concurrency limit) | Security, Architecture |
+| 3 | **Overwrite races with concurrent downloads** — reader gets old key + new ciphertext → 500 | Security, Architecture |
+| 4 | **Restart leaves orphaned ciphertext on disk** — state is memory-only, no cleanup on start | Architecture |
+| 5 | **Path traversal in default download path** — malicious real_name like ../../.bashrc overwrites local files | CLI UX |
+| 6 | **Non-TTY destroy prompt** — piped stdin can accidentally confirm deletion | CLI UX |
+
+### MEDIUM
+
+| # | Issue | Source |
+|---|-------|--------|
+| 7 | Socket cap transiently bypassable — listener spawned before cap check | Security, Architecture |
+| 8 | Write lock held across async rename in upload_file_atomic | Rust, Architecture |
+| 9 | Stringly-typed state errors + string matching drives HTTP status | Rust Idioms |
+| 10 | Destroy returns success even when disk deletion fails (leaks blobs) | Architecture |
+| 11 | --quiet --json still emits JSON on success (inconsistent semantics) | CLI UX |
+| 12 | JSON output schema inconsistent across commands | CLI UX |
+| 13 | Download error message drops HTTP status code | CLI UX |
+| 14 | Malformed multipart test doesn't actually test multipart parsing | Tests |
+| 15 | Socket tests don't exercise real network traffic | Tests |
+| 16 | Overwrite test is sequential only (no concurrent read/write) | Tests |
+
+### LOW
+
+| # | Issue | Source |
+|---|-------|--------|
+| 17 | Clippy: 5 collapsible_if warnings + redundant import | Rust Idioms |
+| 18 | Unused zeroize "derive" feature | Rust Idioms |
+| 19 | Config error doesn't include file path | CLI UX |
+| 20 | Help text says destroy "requires --yes" (it just prompts) | CLI UX |
+| 21 | Missing download -o - (stdout) support | CLI UX |
+| 22 | Missing edge-case upload tests (empty file, Unicode filenames) | Tests |
