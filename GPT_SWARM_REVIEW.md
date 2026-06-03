@@ -1,7 +1,7 @@
 # Swerve Project — GPT Swarm Review Reports
 
-> **3 rounds** of GPT swarm reviews conducted. Each round uses 5 parallel GPT sub-agents.
-> Models used: GPT-5.4, GPT-5.2, GPT-5.4-mini
+> **4 rounds** of GPT swarm reviews conducted. Each round uses 5 parallel GPT sub-agents.
+> Models used: Claude Sonnet 4.5 (general-purpose agents)
 
 ---
 
@@ -200,3 +200,70 @@ These findings were flagged by **multiple agents** as the most important:
 | 20 | Help text says destroy "requires --yes" (it just prompts) | CLI UX |
 | 21 | Missing download -o - (stdout) support | CLI UX |
 | 22 | Missing edge-case upload tests (empty file, Unicode filenames) | Tests |
+
+---
+
+## Round 4 — Post Round-3-Fix Review
+
+**Date**: Round 4  
+**Baseline**: 97 tests passing, zero clippy warnings, all 22 round 3 fixes applied  
+**Agents**: Security, Architecture, CLI UX, Rust Idioms, Test Coverage
+
+### Summary
+
+| Severity | Count |
+|----------|-------|
+| HIGH     | 7     |
+| MEDIUM   | 17    |
+| LOW      | 9     |
+| **Total**| **33**|
+
+Quality is significantly improved. No correctness bugs found. Remaining issues are hardening (TLS, streaming, typed errors), UX polish, and test gaps.
+
+### HIGH Findings
+
+| # | Finding | Source |
+|---|---------|--------|
+| 1 | **No TLS for non-loopback connections** — Management API sends API key + file data over plain HTTP. Any non-localhost deployment exposes secrets to sniffing/MITM. Require HTTPS for remote URLs or document TLS termination requirement. | Security |
+| 2 | **Predictable temp storage path** — Default `temp_dir()/swerve-storage` has no symlink/ownership/permission validation. Local attacker could pre-create or redirect path. Use private per-user dir with restrictive perms. | Security |
+| 3 | **Full memory buffering for all file I/O** — Upload/download/serve paths fully buffer plaintext + ciphertext in memory. 50MB files × 32 concurrent connections = multi-GB spikes. Move to streaming AEAD. | Security, Architecture, Rust Idioms |
+| 4 | **`--json` + `download -o -` sends raw bytes** — Machine-readable mode silently stops being JSON when downloading to stdout. Reject combination or send metadata to stderr. | CLI UX |
+| 5 | **Corrupted ciphertext untested** — No test for download/serve when stored blob is truncated/bit-flipped/deleted. Should return 500, never partial plaintext. | Test Coverage |
+| 6 | **Destroy-vs-overwrite race untested** — Concurrent DELETE + re-upload race path not covered. Should be deterministic (409 or latest version wins). | Test Coverage |
+| 7 | **MAX_UPLOAD_SIZE boundary untested** — No test that exact-limit succeeds and limit+1 fails. | Test Coverage |
+
+### MEDIUM Findings
+
+| # | Finding | Source |
+|---|---------|--------|
+| 8 | **No minimum API key validation** — Server accepts empty/weak keys. Fail closed on empty/short keys at startup. | Security |
+| 9 | **Plaintext API key on Windows** — `~/.fswerve/config.toml` uses default inherited ACLs on Windows (Unix gets 0600). Use OS credential manager or enforce ACLs. | Security |
+| 10 | **Socket bind errors erased to `Box<dyn Error>`** — "Address in use" returns generic 500 instead of 409. Introduce typed bind error enum. | Architecture, Rust Idioms |
+| 11 | **Bind response hides actual address in human string** — Machine clients must parse `"Bound swerve socket on 127.0.0.1:9741"`. Add typed `BindSocketResponse { addr }`. | Architecture |
+| 12 | **Single `RwLock` for all state** — Files, serve index, and sockets share one lock. Split by concern for scalability. | Architecture |
+| 13 | **`status` command checks unauthenticated `/health`** — Only validates reachability, not credentials. Add authenticated `/auth-check` endpoint. | Architecture |
+| 14 | **Upload cancellation leaves orphaned file** — If future dropped after `fs::write` but before state insertion, blob remains until restart. Use temp file + rename guard. | Rust Idioms |
+| 15 | **Widespread `Box<dyn Error>` erases structure** — Client, config, and server startup use `format!` errors losing source chains. Use `thiserror` enums. | Rust Idioms |
+| 16 | **Flat CLI command structure** — File actions split across top-level verbs. Group under `file` subcommand with current verbs as aliases. | CLI UX |
+| 17 | **`completions` ignores `--json`/`--quiet`** — Still emits shell script. Mark flags incompatible or document. | CLI UX |
+| 18 | **Raw reqwest errors lack context** — Transport failures don't include operation, target URL, or guidance. Wrap with context. | CLI UX |
+| 19 | **`config show` doesn't distinguish value sources** — Env/CLI overrides are invisible. Separate saved vs effective, or annotate sources. | CLI UX |
+| 20 | **`config set` requires both fields** — Partial updates awkward. Allow merging with existing config. | CLI UX |
+| 21 | **Unvalidated URL/addr string args** — Malformed input fails late. Use typed parsers (`Url`, `SocketAddr`). | CLI UX |
+| 22 | **Malformed JSON/query tests missing** — No tests for invalid bodies on serve-state, serve-name, sockets endpoints. | Test Coverage |
+| 23 | **Concurrent bind/unbind races untested** — Parallel binds for same addr should yield one success + one conflict. | Test Coverage |
+| 24 | **Filename sanitization untested at HTTP level** — Quotes/CRLF/slashes in names not asserted in Content-Disposition headers. | Test Coverage |
+
+### LOW Findings
+
+| # | Finding | Source |
+|---|---------|--------|
+| 25 | Download/serve code duplication between management and swerve socket paths | Architecture |
+| 26 | Socket addresses modeled as `String` instead of `SocketAddr` | Rust Idioms |
+| 27 | Internal server types publicly exported (unnecessary semver surface) | Rust Idioms |
+| 28 | Clippy test-only `collapsible_if` in config tests | Rust Idioms |
+| 29 | No progress/feedback for large transfers | CLI UX |
+| 30 | No `ValueHint` on file/URL args for shell completions | CLI UX |
+| 31 | Download write error missing destination path | CLI UX |
+| 32 | Config tests depend on real HOME directory | Test Coverage |
+| 33 | Truncated multipart test allows OK or BAD_REQUEST (masks regressions) | Test Coverage |
